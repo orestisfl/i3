@@ -10,9 +10,8 @@
  */
 #include "all.h"
 
+#include "jsmn.h"
 #include <locale.h>
-
-#include <yajl/yajl_parse.h>
 
 /* TODO: refactor the whole parsing thing */
 
@@ -52,7 +51,7 @@ struct focus_mapping {
 static TAILQ_HEAD(focus_mappings_head, focus_mapping) focus_mappings =
     TAILQ_HEAD_INITIALIZER(focus_mappings);
 
-static int json_start_map(void *ctx) {
+static int json_start_map() {
     LOG("start of map, last_key = %s\n", last_key);
     if (parsing_swallows) {
         LOG("creating new swallow\n");
@@ -89,7 +88,7 @@ static int json_start_map(void *ctx) {
     return 1;
 }
 
-static int json_end_map(void *ctx) {
+static int json_end_map() {
     LOG("end of map\n");
     if (!parsing_swallows &&
         !parsing_rect &&
@@ -214,7 +213,7 @@ static int json_end_map(void *ctx) {
     return 1;
 }
 
-static int json_end_array(void *ctx) {
+static int json_end_array() {
     LOG("end of array\n");
     if (!parsing_swallows && !parsing_focus && !parsing_marks) {
         con_fix_percent(json_node);
@@ -253,7 +252,7 @@ static int json_end_array(void *ctx) {
     return 1;
 }
 
-static int json_key(void *ctx, const unsigned char *val, size_t len) {
+static int json_key(const char *val, size_t len) {
     LOG("key: %.*s\n", (int)len, val);
     FREE(last_key);
     last_key = scalloc(len + 1, 1);
@@ -298,7 +297,7 @@ static int json_key(void *ctx, const unsigned char *val, size_t len) {
     return 1;
 }
 
-static int json_string(void *ctx, const unsigned char *val, size_t len) {
+static int json_string(const char *val, size_t len) {
     LOG("string: %.*s for key %s\n", (int)len, val, last_key);
     if (parsing_swallows) {
         char *sval;
@@ -478,7 +477,7 @@ static int json_string(void *ctx, const unsigned char *val, size_t len) {
     return 1;
 }
 
-static int json_int(void *ctx, long long val) {
+static int json_int(long long val) {
     LOG("int %lld for key %s\n", val, last_key);
     /* For backwards compatibility with i3 < 4.8 */
     if (strcasecmp(last_key, "type") == 0) {
@@ -569,7 +568,7 @@ static int json_int(void *ctx, long long val) {
     return 1;
 }
 
-static int json_bool(void *ctx, int val) {
+static int json_bool(int val) {
     LOG("bool %d for key %s\n", val, last_key);
     if (strcasecmp(last_key, "focused") == 0 && val) {
         to_focus = json_node;
@@ -589,7 +588,7 @@ static int json_bool(void *ctx, int val) {
     return 1;
 }
 
-static int json_double(void *ctx, double val) {
+static int json_double(double val) {
     LOG("double %f for key %s\n", val, last_key);
     if (strcasecmp(last_key, "percent") == 0) {
         json_node->percent = val;
@@ -597,56 +596,22 @@ static int json_double(void *ctx, double val) {
     return 1;
 }
 
-static json_content_t content_result;
-static int content_level;
-
-static int json_determine_content_deeper(void *ctx) {
-    content_level++;
-    return 1;
-}
-
-static int json_determine_content_shallower(void *ctx) {
-    content_level--;
-    return 1;
-}
-
-static int json_determine_content_string(void *ctx, const unsigned char *val, size_t len) {
-    if (strcasecmp(last_key, "type") != 0 || content_level > 1) {
-        return 1;
-    }
-
-    DLOG("string = %.*s, last_key = %s\n", (int)len, val, last_key);
-    if (strncasecmp((const char *)val, "workspace", len) == 0) {
-        content_result = JSON_CONTENT_WORKSPACE;
-    }
-    return 0;
-}
-
 /*
  * Returns true if the provided JSON could be parsed by yajl.
  *
  */
 bool json_validate(const char *buf, const size_t len) {
-    bool valid = true;
-    yajl_handle hand = yajl_alloc(NULL, NULL, NULL);
-    /* Allowing comments allows for more user-friendly layout files. */
-    yajl_config(hand, yajl_allow_comments, true);
-    /* Allow multiple values, i.e. multiple nodes to attach */
-    yajl_config(hand, yajl_allow_multiple_values, true);
+    jsmn_parser parser;
+    jsmntok_t tokens[1024]; /* Adjust size as needed */
+    jsmn_init(&parser);
 
-    setlocale(LC_NUMERIC, "C");
-    if (yajl_parse(hand, (const unsigned char *)buf, len) != yajl_status_ok) {
-        unsigned char *str = yajl_get_error(hand, 1, (const unsigned char *)buf, len);
-        ELOG("JSON parsing error: %s\n", str);
-        yajl_free_error(hand, str);
-        valid = false;
+    int ret = jsmn_parse(&parser, buf, len, tokens, sizeof(tokens) / sizeof(tokens[0]));
+
+    if (ret < 0) {
+        ELOG("JSON parsing error: %d\n", ret);
+        return false;
     }
-    setlocale(LC_NUMERIC, "");
-
-    yajl_complete_parse(hand);
-    yajl_free(hand);
-
-    return valid;
+    return true;
 }
 
 /* Parses the given JSON file until it encounters the first “type” property to
@@ -654,65 +619,161 @@ bool json_validate(const char *buf, const size_t len) {
  * is important to know when deciding where (and how) to append the contents.
  * */
 json_content_t json_determine_content(const char *buf, const size_t len) {
-    // We default to JSON_CONTENT_CON because it is legal to not include
-    // “"type": "con"” in the JSON files for better readability.
-    content_result = JSON_CONTENT_CON;
-    content_level = 0;
-    static yajl_callbacks callbacks = {
-        .yajl_string = json_determine_content_string,
-        .yajl_map_key = json_key,
-        .yajl_start_array = json_determine_content_deeper,
-        .yajl_start_map = json_determine_content_deeper,
-        .yajl_end_map = json_determine_content_shallower,
-        .yajl_end_array = json_determine_content_shallower,
-    };
-    yajl_handle hand = yajl_alloc(&callbacks, NULL, NULL);
-    /* Allowing comments allows for more user-friendly layout files. */
-    yajl_config(hand, yajl_allow_comments, true);
-    /* Allow multiple values, i.e. multiple nodes to attach */
-    yajl_config(hand, yajl_allow_multiple_values, true);
-    setlocale(LC_NUMERIC, "C");
-    const yajl_status stat = yajl_parse(hand, (const unsigned char *)buf, len);
-    if (stat != yajl_status_ok && stat != yajl_status_client_canceled) {
-        unsigned char *str = yajl_get_error(hand, 1, (const unsigned char *)buf, len);
-        ELOG("JSON parsing error: %s\n", str);
-        yajl_free_error(hand, str);
+    jsmn_parser parser;
+    jsmntok_t tokens[1024];  // Adjust size as needed
+    jsmn_init(&parser);
+
+    int ret = jsmn_parse(&parser, buf, len, tokens, sizeof(tokens) / sizeof(tokens[0]));
+
+    if (ret < 0) {
+        ELOG("JSON parsing error: %d\n", ret);
+        return JSON_CONTENT_CON;  // Default fallback
     }
 
-    setlocale(LC_NUMERIC, "");
-    yajl_complete_parse(hand);
-    yajl_free(hand);
+    // Traverse tokens to find the first "type" key
+    for (int i = 1; i < ret; i++) {
+        if (tokens[i].type == JSMN_STRING && strncmp(buf + tokens[i].start, "type", tokens[i].end - tokens[i].start) == 0) {
+            if (i + 1 < ret && tokens[i + 1].type == JSMN_STRING) {
+                if (strncmp(buf + tokens[i + 1].start, "workspace", tokens[i + 1].end - tokens[i + 1].start) == 0) {
+                    return JSON_CONTENT_WORKSPACE;
+                }
+            }
+        }
+    }
 
-    return content_result;
+    return JSON_CONTENT_CON;
+}
+
+// Hand-written function to convert a string to an integer
+static bool str2int(const char *str, size_t len) {
+    long long int ret = 0;
+    size_t i = 0;
+
+    long long sign = 1;
+    if (str[0] == '-') {
+        sign = -1;
+        i++;
+    } else if (str[0] == '+') {
+        i++;
+    }
+
+    for (; i < len; ++i) {
+        if (str[i] < '0' || str[i] > '9') {
+            return false;
+        }
+        ret = ret * 10 + (str[i] - '0');
+    }
+    json_int(sign * ret);
+    return true;
+}
+
+// Hand-written function to convert a string to a floating-point number
+static void str2double(const char *str, size_t len) {
+    double ret = 0.0;
+    double factor = 1.0;
+    size_t i = 0;
+
+    double sign = 1.0;
+    if (str[0] == '-') {
+        sign = -1;
+        i++;
+    } else if (str[0] == '+') {
+        i++;
+    }
+
+    // Handle integer part
+    while (i < len && str[i] >= '0' && str[i] <= '9') {
+        ret = ret * 10 + (str[i] - '0');
+        i++;
+    }
+
+    // Handle decimal point, if any
+    if (i < len && str[i] == '.') {
+        i++;
+        while (i < len && str[i] >= '0' && str[i] <= '9') {
+            factor *= 0.1;
+            ret += (str[i] - '0') * factor;
+            i++;
+        }
+    }
+
+    json_double(sign * ret);
+}
+
+void handle_primitive(const char *str, size_t len) {
+    if (str == NULL || len == 0) {
+        return;
+    }
+
+    if (!str2int(str, len)) {
+        str2double(str, len);
+    }
+}
+
+static int rec_parse(const char *js, jsmntok_t *t, size_t count) {
+    if (count == 0) {
+        return 0;
+    }
+
+    const char *v = js + t->start;
+    const size_t len = t->end - t->start;
+    if (t->type == JSMN_PRIMITIVE) {
+        if (v[0] == 't' || v[0] == 'f') {
+            json_bool(v[0] == 't');
+        } else {
+            handle_primitive(v, len);
+        }
+        return 1;
+    } else if (t->type == JSMN_STRING) {
+        json_string(v, len);
+        return 1;
+    } else if (t->type == JSMN_OBJECT) {
+        json_start_map();
+        int j = 0;
+        for (int i = 0; i < t->size; i++) {
+            jsmntok_t *key = t + 1 + j;
+            json_key(js + key->start, key->end - key->start);
+            j++;
+            if (key->size > 0) {
+                j += rec_parse(js, t + 1 + j, count - j);
+            }
+        }
+        json_end_map();
+        return j + 1;
+    } else if (t->type == JSMN_ARRAY) {
+        int j = 0;
+        for (int i = 0; i < t->size; i++) {
+            j += rec_parse(js, t + 1 + j, count - j);
+        }
+        json_end_array();
+        return j + 1;
+    }
+    return 0;
+}
+
+int jsmn_parse_all(const char *js, const size_t len) {
+    jsmn_parser parser;
+    jsmntok_t tokens[1024 * 10];  // Adjust size as needed
+    jsmn_init(&parser);
+
+    int ret = jsmn_parse(&parser, js, len, tokens, sizeof(tokens) / sizeof(tokens[0]));
+    if (ret < 0) {
+        ELOG("error at %d: %.*s\n", parser.pos, 50, js + parser.pos);
+        return ret;
+    }
+
+    for (unsigned int pos = 0; pos < parser.toknext;) {
+        jsmntok_t t = tokens[pos];
+        if (t.end == 0) {
+            break;
+        }
+        int parsed = rec_parse(js, tokens + pos, parser.toknext - pos);
+        pos += max(parsed, 1);
+    }
+    return ret;
 }
 
 void tree_append_json(Con *con, const char *buf, const size_t len, char **errormsg) {
-    static yajl_callbacks callbacks = {
-        .yajl_boolean = json_bool,
-        .yajl_integer = json_int,
-        .yajl_double = json_double,
-        .yajl_string = json_string,
-        .yajl_start_map = json_start_map,
-        .yajl_map_key = json_key,
-        .yajl_end_map = json_end_map,
-        .yajl_end_array = json_end_array,
-    };
-    yajl_handle hand = yajl_alloc(&callbacks, NULL, NULL);
-    /* Allowing comments allows for more user-friendly layout files. */
-    yajl_config(hand, yajl_allow_comments, true);
-    /* Allow multiple values, i.e. multiple nodes to attach */
-    yajl_config(hand, yajl_allow_multiple_values, true);
-    /* We don't need to validate that the input is valid UTF8 here.
-     * tree_append_json is called in two cases:
-     * 1. With the append_layout command. json_validate is called first and will
-     *    fail on invalid UTF8 characters so we don't need to recheck.
-     * 2. With an in-place restart. The rest of the codebase should be
-     *    responsible for producing valid UTF8 JSON output. If not,
-     *    tree_append_json will just preserve invalid UTF8 strings in the tree
-     *    instead of failing to parse the layout file which could lead to
-     *    problems like in #3156.
-     * Either way, disabling UTF8 validation slightly speeds up yajl. */
-    yajl_config(hand, yajl_dont_validate_strings, true);
     json_node = con;
     to_focus = NULL;
     parsing_gaps = false;
@@ -725,35 +786,29 @@ void tree_append_json(Con *con, const char *buf, const size_t len, char **errorm
     parsing_geometry = false;
     parsing_focus = false;
     parsing_marks = false;
-    setlocale(LC_NUMERIC, "C");
-    const yajl_status stat = yajl_parse(hand, (const unsigned char *)buf, len);
-    if (stat != yajl_status_ok) {
-        unsigned char *str = yajl_get_error(hand, 1, (const unsigned char *)buf, len);
-        ELOG("JSON parsing error: %s\n", str);
+
+    int ret = jsmn_parse_all(buf, len);
+    if (ret < 0) {
+        // TODO: JSMN_ERROR_NOMEM
+        ELOG("JSON parsing error: %d\n", ret);
         if (errormsg != NULL) {
-            *errormsg = sstrdup((const char *)str);
+            *errormsg = sstrdup("JSON parsing error");
         }
-        yajl_free_error(hand, str);
-        while (incomplete-- > 0) {
-            Con *parent = json_node->parent;
-            DLOG("freeing incomplete container %p\n", json_node);
-            if (json_node == to_focus) {
-                to_focus = NULL;
-            }
-            con_free(json_node);
-            json_node = parent;
+    }
+    while (incomplete-- > 0) {
+        Con *parent = json_node->parent;
+        DLOG("freeing incomplete container %p\n", json_node);
+        if (json_node == to_focus) {
+            to_focus = NULL;
         }
+        con_free(json_node);
+        json_node = parent;
     }
 
     /* In case not all containers were restored, we need to fix the
      * percentages, otherwise i3 will crash immediately when rendering the
      * next time. */
     con_fix_percent(con);
-
-    setlocale(LC_NUMERIC, "");
-    yajl_complete_parse(hand);
-    yajl_free(hand);
-
     if (to_focus) {
         con_activate(to_focus);
     }
