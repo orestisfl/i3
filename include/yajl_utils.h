@@ -11,9 +11,7 @@
 
 #include <config.h>
 
-#include <yajl/yajl_gen.h>
-#include <yajl/yajl_parse.h>
-#include <yajl/yajl_version.h>
+#include "yajl_compat.h"
 
 /* Shorter names for all those yajl_gen_* functions */
 #define y(x, ...) yajl_gen_##x(gen, ##__VA_ARGS__)
